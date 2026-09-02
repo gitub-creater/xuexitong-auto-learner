@@ -1,0 +1,15 @@
+# 构建产物与运行时文件
+dist/
+build/
+__pycache__/
+*.spec
+
+# 含密钥与本地数据，绝不入库
+config.json
+learning.log
+debug_screenshot.png
+
+# 临时测试脚本
+_test*.py
+*.tmp
+_new_block.tmp
