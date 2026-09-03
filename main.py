@@ -28,8 +28,11 @@ if getattr(sys, "frozen", False):
 else:
     APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 打包版随包分发 Playwright 浏览器（exe 旁的 ms-playwright 目录）
-_BUNDLED_BROWSERS = os.path.join(APP_DIR, "ms-playwright")
+# 打包版随包分发 Playwright 浏览器（_internal 目录中）
+_BUNDLED_BROWSERS = os.path.join(APP_DIR, "_internal", "ms-playwright")
+if not os.path.isdir(_BUNDLED_BROWSERS):
+    # 兼容旧版本：直接在exe旁边
+    _BUNDLED_BROWSERS = os.path.join(APP_DIR, "ms-playwright")
 if os.path.isdir(_BUNDLED_BROWSERS):
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = _BUNDLED_BROWSERS
 
