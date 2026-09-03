@@ -13,3 +13,30 @@ debug_screenshot.png
 _test*.py
 *.tmp
 _new_block.tmp
+
+# 打包相关
+学习通自动学习助手_绿色版/
+学习通自动学习助手_绿色版.zip
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+
+# 备份文件
+*.backup
+*.bak
+
+# IDE 相关
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini

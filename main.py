@@ -856,6 +856,94 @@ class XueXiTongLearner:
     }
     """
 
+
+    # 识别填空题/简答题（input text、textarea）
+    JS_FIND_TEXT_QUESTION = r"""
+    () => {
+        function vis(el) {
+            const r = el.getBoundingClientRect();
+            return r.width > 2 && r.height > 2 && getComputedStyle(el).visibility !== 'hidden';
+        }
+        
+        const textInputs = Array.from(document.querySelectorAll('input[type=text], textarea'))
+            .filter(vis)
+            .filter(el => !el.disabled && !el.readOnly);
+        
+        if (textInputs.length === 0) return null;
+        
+        let container = textInputs[0].closest('form,div[class*=question],div[class*=quiz],li,ul') || textInputs[0].parentElement;
+        for (let i = 0; i < 8 && container && container.parentElement; i++) {
+            const text = (container.innerText || '').trim();
+            if (text.length >= 20) break;
+            if (container.parentElement === document.body) break;
+            container = container.parentElement;
+        }
+        
+        let questionText = '';
+        if (container) {
+            const clone = container.cloneNode(true);
+            clone.querySelectorAll('input, textarea, button').forEach(el => el.remove());
+            questionText = (clone.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 600);
+        }
+        
+        if (!questionText || questionText.length < 5) return null;
+        
+        return {
+            question: questionText,
+            inputCount: textInputs.length,
+            inputType: textInputs[0].tagName.toLowerCase() === 'textarea' ? 'textarea' : 'text'
+        };
+    }
+    """
+    
+    JS_FILL_TEXT_ANSWER = r"""
+    (answers) => {
+        function vis(el) {
+            const r = el.getBoundingClientRect();
+            return r.width > 2 && r.height > 2 && getComputedStyle(el).visibility !== 'hidden';
+        }
+        
+        const textInputs = Array.from(document.querySelectorAll('input[type=text], textarea'))
+            .filter(vis)
+            .filter(el => !el.disabled && !el.readOnly);
+        
+        if (!Array.isArray(answers)) answers = [answers];
+        
+        let filled = 0;
+        for (let i = 0; i < Math.min(textInputs.length, answers.length); i++) {
+            const input = textInputs[i];
+            const answer = String(answers[i] || '').trim();
+            input.value = answer;
+            ['input', 'change', 'blur'].forEach(eventType => {
+                input.dispatchEvent(new Event(eventType, { bubbles: true }));
+            });
+            filled++;
+        }
+        return filled;
+    }
+    """
+    
+    JS_CHECK_TEXT_ERROR = r"""
+    () => {
+        const errorKeywords = ['错误', '不正确', '答错', 'wrong', 'incorrect', 'error'];
+        const errorSelectors = [
+            '[class*=error]', '[class*=wrong]', '[class*=incorrect]',
+            '.tip', '.hint', '.message', '.feedback'
+        ];
+        
+        for (const sel of errorSelectors) {
+            const elements = Array.from(document.querySelectorAll(sel));
+            for (const el of elements) {
+                const text = (el.innerText || '').toLowerCase();
+                if (errorKeywords.some(kw => text.includes(kw))) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    """
+
     JS_NEXT_SECTION = r"""
     () => {
         function vis(el) {
@@ -959,7 +1047,10 @@ class XueXiTongLearner:
                 if not self.is_running:
                     break
 
-                self.log(f"第 {section_no} 节完成，正在跳到下一节...")
+                self.log(f"第 {section_no} 节完成，检查是否有课后题目...")
+                self._handle_non_video_questions()
+                
+                self.log(f"正在跳到下一节...")
                 self._post_to_ui(lambda s=tree_item, n=section_no:
                                  self.course_tree.set(s, "status", f"已完成 {n} 节"))
                 if not self._goto_next_section():
@@ -1086,6 +1177,12 @@ class XueXiTongLearner:
                     frame.evaluate(self.JS_RESUME)
                 except Exception:
                     pass
+            elif self._handle_text_questions():
+                time.sleep(1)
+                try:
+                    frame.evaluate(self.JS_RESUME)
+                except Exception:
+                    pass
             elif info["paused"]:
                 # 可能有防挂机确认框挡住播放，先尝试点掉它再恢复播放
                 self._try_close_masks()
@@ -1104,6 +1201,34 @@ class XueXiTongLearner:
                 total = int(info["duration"]) if info["duration"] else 0
                 self.log(f"   播放中：{int(info['time'])}/{total} 秒")
             time.sleep(2)
+
+    def _handle_non_video_questions(self):
+        """处理视频外的题目（课后作业、章节测试等）。"""
+        if not self.is_running or self.is_paused:
+            return
+        
+        time.sleep(2)
+        
+        attempt_count = 0
+        max_attempts = 5
+        
+        while attempt_count < max_attempts and self.is_running and not self.is_paused:
+            if self._close_requested.is_set():
+                return
+            
+            found_choice = self._handle_popup_questions()
+            found_text = self._handle_text_questions()
+            
+            if not found_choice and not found_text:
+                if attempt_count == 0:
+                    self.log("未检测到课后题目")
+                break
+            
+            attempt_count += 1
+            time.sleep(1)
+        
+        if attempt_count >= max_attempts:
+            self.log(f"已处理 {attempt_count} 道题目，继续下一节")
 
     def _goto_next_section(self):
         """点击官方“下一节”按钮推进到下一节；找不到视为课程结束。"""
@@ -1224,6 +1349,87 @@ class XueXiTongLearner:
             return True
         return False
 
+    def _handle_text_questions(self):
+        """扫描所有 frame，处理填空题和简答题。"""
+        for frame in self._live_frames():
+            if self._close_requested.is_set():
+                return False
+            
+            try:
+                data = frame.evaluate(self.JS_FIND_TEXT_QUESTION)
+            except Exception:
+                continue
+            
+            if not data or not data.get("question"):
+                continue
+            
+            question = data.get("question", "")
+            input_count = data.get("inputCount", 1)
+            input_type = data.get("inputType", "text")
+            
+            type_name = "简答题" if input_type == "textarea" else "填空题"
+            self.log(f"检测到{type_name}（{input_count} 个输入框）：{question[:60]}")
+            
+            attempt = 0
+            while True:
+                if self._close_requested.is_set():
+                    return False
+                
+                attempt += 1
+                answer = self._generate_text_answer(question, input_count, input_type, attempt - 1)
+                
+                if not answer:
+                    self.log(f"AI 生成答案失败（第 {attempt} 次尝试），1秒后重试...")
+                    time.sleep(1)
+                    continue
+                
+                if isinstance(answer, list):
+                    for i, ans in enumerate(answer):
+                        self.log(f"AI 生成答案 [{i+1}]（第 {attempt} 次尝试）：{ans[:100]}")
+                else:
+                    self.log(f"AI 生成答案（第 {attempt} 次尝试）：{answer[:100]}")
+                
+                try:
+                    filled = frame.evaluate(self.JS_FILL_TEXT_ANSWER, answer)
+                    if filled > 0:
+                        self.log(f"已填写 {filled} 个输入框")
+                    else:
+                        self.log("填写失败")
+                        continue
+                except Exception as e:
+                    self.log(f"填写答案时出错：{e}")
+                    continue
+                
+                time.sleep(0.8)
+                
+                try:
+                    frame.evaluate(self.JS_CLICK_BTN, "^(提交|提交答案|确定|继续|下一题)$")
+                    self.log("已点击提交按钮")
+                except Exception:
+                    pass
+                
+                time.sleep(2)
+                
+                is_wrong = False
+                try:
+                    is_wrong = frame.evaluate(self.JS_CHECK_TEXT_ERROR)
+                except Exception:
+                    pass
+                
+                if is_wrong:
+                    self.log(f"✗ 第 {attempt} 次作答错误，重新生成答案...")
+                    time.sleep(1)
+                    continue
+                else:
+                    self.log(f"✓ 文本题已作答（尝试 {attempt} 次后成功）")
+                    try:
+                        frame.evaluate(self.JS_CLICK_BTN, "^(继续|关闭|确定|知道了)$")
+                    except Exception:
+                        pass
+                    return True
+        
+        return False
+
     def _click_after_answer(self, frame):
         """点掉答题结果/关闭类按钮。"""
         try:
@@ -1286,6 +1492,73 @@ class XueXiTongLearner:
         if not nums:
             return None
         return int(nums[-1]) - 1
+
+    def _generate_text_answer(self, question, input_count=1, input_type="text", retry_attempt=0):
+        """调用 AI 生成填空题/简答题的文本答案。"""
+        cfg = self.ai_config or {}
+        
+        if not cfg.get("enabled") or not cfg.get("api_key"):
+            return None
+        
+        try:
+            if input_type == "textarea":
+                system_prompt = "你是答题助手。请根据题目要求给出准确、完整的答案。简答题需要完整表述，字数在50-200字之间。直接给出答案内容，不要添加前缀。"
+                if retry_attempt > 0:
+                    system_prompt += f"\n这是第{retry_attempt + 1}次尝试，请换一个角度或更详细地回答。"
+            else:
+                if input_count == 1:
+                    system_prompt = "你是答题助手。请根据题目要求给出准确的填空答案。答案要简洁精确，通常是一个词、短语或数字。直接给出答案，不要添加任何说明或标点。"
+                else:
+                    system_prompt = f"你是答题助手。这道题有{input_count}个空需要填写。请给出{input_count}个答案，每行一个答案，不要编号。答案要简洁精确。"
+                if retry_attempt > 0:
+                    system_prompt += f"\n这是第{retry_attempt + 1}次尝试，之前的答案不正确，请重新思考。"
+            
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question}
+            ]
+            
+            endpoint = "/responses" if (cfg.get("api_mode") or "chat") == "responses" else "/chat/completions"
+            data, _ = self._ai_send(endpoint, payload=self._build_chat_payload(messages))
+            
+            content = ""
+            try:
+                content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            except Exception:
+                return None
+            
+            if not content or not content.strip():
+                return None
+            
+            content = content.strip()
+            
+            if input_count > 1:
+                lines = [line.strip() for line in content.split('\n') if line.strip()]
+                cleaned_lines = []
+                for line in lines:
+                    line = re.sub(r'^\d+[.、\s]+', '', line)
+                    if line:
+                        cleaned_lines.append(line)
+                
+                if len(cleaned_lines) >= input_count:
+                    return cleaned_lines[:input_count]
+                elif len(cleaned_lines) > 0:
+                    while len(cleaned_lines) < input_count:
+                        cleaned_lines.append(cleaned_lines[0])
+                    return cleaned_lines
+                else:
+                    parts = re.split(r'[,，;；]', content)
+                    parts = [p.strip() for p in parts if p.strip()]
+                    if len(parts) >= input_count:
+                        return parts[:input_count]
+                    else:
+                        return content
+            
+            return content
+            
+        except Exception as e:
+            self.log(f"AI 生成答案出错：{e}")
+            return None
 
     @staticmethod
     def _normalize_ai_base_url(base_url):
