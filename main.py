@@ -1150,6 +1150,7 @@ class XueXiTongLearner:
         time.sleep(2)
 
         last_report = time.monotonic()
+        last_question_check = 0  # 上次检查题目的时间
         deadline = time.monotonic() + 4 * 3600
         while self.is_running and not self.is_paused:
             if self._close_requested.is_set():
@@ -1171,31 +1172,40 @@ class XueXiTongLearner:
                 self.log("✓ 视频播放完成")
                 return
 
-            if self._handle_popup_questions():
-                time.sleep(1)
-                try:
-                    frame.evaluate(self.JS_RESUME)
-                except Exception:
-                    pass
-            elif self._handle_text_questions():
-                time.sleep(1)
-                try:
-                    frame.evaluate(self.JS_RESUME)
-                except Exception:
-                    pass
+            # 题目检查频率限制：每5秒最多检查一次，避免频繁扫描
+            now = time.monotonic()
+            if now - last_question_check >= 5:
+                last_question_check = now
+                if self._handle_popup_questions():
+                    time.sleep(1)
+                    try:
+                        frame.evaluate(self.JS_RESUME)
+                    except Exception:
+                        pass
+                elif self._handle_text_questions():
+                    time.sleep(1)
+                    try:
+                        frame.evaluate(self.JS_RESUME)
+                    except Exception:
+                        pass
+                elif info["paused"]:
+                    # 可能有防挂机确认框挡住播放，先尝试点掉它再恢复播放
+                    self._try_close_masks()
+                    try:
+                        frame.evaluate(self.JS_CLICK_BTN, "^(确定|继续观看|继续学习|继续)$")
+                    except Exception:
+                        pass
+                    try:
+                        frame.evaluate(self.JS_RESUME)
+                    except Exception:
+                        pass
             elif info["paused"]:
-                # 可能有防挂机确认框挡住播放，先尝试点掉它再恢复播放
-                self._try_close_masks()
-                try:
-                    frame.evaluate(self.JS_CLICK_BTN, "^(确定|继续观看|继续学习|继续)$")
-                except Exception:
-                    pass
+                # 视频暂停但未到题目检查时间，仅尝试恢复播放
                 try:
                     frame.evaluate(self.JS_RESUME)
                 except Exception:
                     pass
 
-            now = time.monotonic()
             if now - last_report > 60:
                 last_report = now
                 total = int(info["duration"]) if info["duration"] else 0
@@ -1287,6 +1297,12 @@ class XueXiTongLearner:
 
             options = data["options"]
             question = data.get("question") or ""
+            
+            # 验证题目是否有效（至少8个字符）
+            if not question or len(question.strip()) < 8:
+                self.log(f"检测到题目但内容不完整，跳过AI处理")
+                continue
+                
             self.log(f"检测到题目弹窗（{len(options)} 个选项）：{question[:60]}")
 
             tried = set()
@@ -1351,6 +1367,11 @@ class XueXiTongLearner:
 
     def _handle_text_questions(self):
         """扫描所有 frame，处理填空题和简答题。"""
+        cfg = self.ai_config or {}
+        # 文本题必须启用AI才能处理，否则直接跳过
+        if not cfg.get("enabled") or not cfg.get("api_key"):
+            return False
+            
         for frame in self._live_frames():
             if self._close_requested.is_set():
                 return False
@@ -1367,11 +1388,19 @@ class XueXiTongLearner:
             input_count = data.get("inputCount", 1)
             input_type = data.get("inputType", "text")
             
+            # 验证题目有效性（至少5个字符）
+            if not question or len(question.strip()) < 5:
+                self.log(f"检测到文本题目但内容不完整，跳过")
+                continue
+            
             type_name = "简答题" if input_type == "textarea" else "填空题"
             self.log(f"检测到{type_name}（{input_count} 个输入框）：{question[:60]}")
             
             attempt = 0
-            while True:
+            consecutive_failures = 0  # 连续失败次数（AI生成失败或填写失败）
+            max_consecutive_failures = 5  # 连续失败5次后跳过（防bug死循环）
+            
+            while self.is_running and not self.is_paused:
                 if self._close_requested.is_set():
                     return False
                 
@@ -1379,9 +1408,16 @@ class XueXiTongLearner:
                 answer = self._generate_text_answer(question, input_count, input_type, attempt - 1)
                 
                 if not answer:
-                    self.log(f"AI 生成答案失败（第 {attempt} 次尝试），1秒后重试...")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.log(f"✗ AI 连续生成答案失败 {consecutive_failures} 次，跳过该题")
+                        break
+                    self.log(f"AI 生成答案失败（第 {attempt} 次尝试，连续失败 {consecutive_failures} 次），1秒后重试...")
                     time.sleep(1)
                     continue
+                
+                # 成功生成答案，重置连续失败计数
+                consecutive_failures = 0
                 
                 if isinstance(answer, list):
                     for i, ans in enumerate(answer):
@@ -1394,11 +1430,24 @@ class XueXiTongLearner:
                     if filled > 0:
                         self.log(f"已填写 {filled} 个输入框")
                     else:
-                        self.log("填写失败")
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            self.log(f"✗ 连续填写失败 {consecutive_failures} 次，跳过该题")
+                            break
+                        self.log(f"填写失败（连续失败 {consecutive_failures} 次），重试...")
+                        time.sleep(1)
                         continue
                 except Exception as e:
-                    self.log(f"填写答案时出错：{e}")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        self.log(f"✗ 连续填写出错 {consecutive_failures} 次，跳过该题")
+                        break
+                    self.log(f"填写答案时出错：{e}（连续失败 {consecutive_failures} 次），重试...")
+                    time.sleep(1)
                     continue
+                
+                # 成功填写，重置连续失败计数
+                consecutive_failures = 0
                 
                 time.sleep(0.8)
                 
@@ -1454,7 +1503,8 @@ class XueXiTongLearner:
     def _pick_answer(self, question, options, tried):
         """选择答案：启用 AI 时问接口，失败或重复时按顺序试剩余选项。"""
         cfg = self.ai_config or {}
-        if cfg.get("enabled") and cfg.get("api_key"):
+        # 必须同时满足：启用AI、有API Key、有有效题目
+        if cfg.get("enabled") and cfg.get("api_key") and question and len(question.strip()) >= 8:
             try:
                 idx = self._ai_pick_option(question, options)
                 if idx is not None and 0 <= idx < len(options) and idx not in tried:
@@ -1463,6 +1513,7 @@ class XueXiTongLearner:
                 self.log("AI 未给出有效答案，按顺序尝试剩余选项")
             except Exception as e:
                 self.log(f"AI 调用失败（{e}），按顺序尝试剩余选项")
+        # 未启用AI或AI失败时，按顺序尝试剩余选项
         for i in range(len(options)):
             if i not in tried:
                 return i
